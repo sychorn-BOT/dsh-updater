@@ -1,0 +1,24 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 运行时产物（更新脚本把日志、plan、备份写进核心树，别的位置也兜一下）
+.dsh-updater/
+plan-*.json
+last-update.json
+backup-*/
+*.log
+
+# 本地覆盖
+.env
+.env.*
+*.local
+config.local.*
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp

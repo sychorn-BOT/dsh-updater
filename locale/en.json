@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "DSH Update Checker",
+    "description": "Shows the installed @deepseek-ai/dsh version under the composer, checks npm for a newer release, and asks whether to update now."
+  }
+}

@@ -1,0 +1,18 @@
+# dsh-updater 的 bundle patch —— 把「检查 DSH 更新」这一行挂进配置树
+#
+#   insert: 往配置树里加一行 entry
+#   id:     唯一标识；用户层的 id patch 可以按这个 id 覆盖 config
+#   name:   'dsh-updater' 解析到本包入口 lib/index.js（宿主半侧）
+#
+# 可改的 config：
+#   channel     'latest' | 'next' | 'alpha'，默认 latest
+#   registry    npm 仓库地址，默认 https://registry.npmjs.org
+#   cacheSeconds 宿主侧缓存秒数，默认 600
+#   allowUpdate 弹窗里给不给「现在更新」按钮（false = 只查不装），默认 true
+
+- insert:
+    - id: dsh-updater
+      name: 'dsh-updater'
+      config:
+        channel: latest
+        allowUpdate: true

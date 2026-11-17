@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "DSH 更新检查",
+    "description": "在输入框下面显示当前装的是哪一版 @deepseek-ai/dsh，去 npm 看有没有新的发布；查到就弹窗问要不要现在更新。"
+  }
+}

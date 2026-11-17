@@ -1,0 +1,4 @@
+# 文本统一按 LF 存进仓库；.ps1 必须保持纯 ASCII（tests/host.test.mjs 会检查）
+* text=auto
+*.ps1 text eol=lf
+*.svg text

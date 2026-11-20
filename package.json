@@ -1,6 +1,6 @@
 {
   "name": "dsh-updater",
-  "version": "1.4.2",
+  "version": "1.5.0",
   "private": true,
   "description": "Checks npm for a newer @deepseek-ai/dsh, shows it under the composer, and offers a one-click update that installs the new release and restarts DSH.",
   "type": "module",
@@ -39,7 +39,8 @@
   "scripts": {
     "test": "node tests/host.test.mjs && node tests/client.test.mjs",
     "dry-run": "node tests/dry-run.mjs",
-    "compat-preview": "node tests/compat-preview.mjs"
+    "compat-preview": "node tests/compat-preview.mjs",
+    "script-flow": "node tests/script-flow.mjs"
   },
   "keywords": [
     "dsh",

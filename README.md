@@ -5,7 +5,8 @@
 
 - 当前安装版本：顺着启动入口往上找 `@deepseek-ai/dsh` 的 `package.json`，不靠环境变量猜
 - npm 上的最新版本：GET `https://registry.npmjs.org/-/package/@deepseek-ai%2fdsh/dist-tags`
-- 点一下徽标 = 展开明细（各 channel、包位置、检查时间、上次更新的结论）；再点收起
+- 点一下徽标 = 展开明细（各 channel、包位置、检查时间、上次更新的结论 + 每步耗时的进度条）；再点收起
+- 更新过程有进度条：准备那几步是真的往前走；装的时候 DSH 停着，条子流动着等；装完把每一步花了多久读回来
 - 模型也能自己问：工具 `dsh_check_update`（参数 `refresh: true` 强制重查）
 - 模型还能自检：工具 `dsh_update_doctor`——真跑一次 powershell 和 npm，看这台机器上更新到底卡在哪
 
@@ -56,8 +57,48 @@
   pnpm-<tag>-out/err.log   装插件时的 pnpm 输出
   plan-<时间>.json         宿主交给脚本的那份计划
   backup-<时间>\           装之前的 package.json / package-lock.json
-  last-update.json         上次的结论（徽标「上次更新」那一行）
+  last-update.json         上次的结论 + 每一步的进度（徽标「上次更新」和进度条都读它）
 ```
+
+## 进度条
+
+按下「现在更新」以后，弹窗里那条进度分三段：
+
+| 阶段 | 谁在报进度 | 条子长什么样 |
+| --- | --- | --- |
+| 准备：查 npm → 插件闸门 → 写计划 → 自检 → 拉起脚本 | 宿主自己（`update.steps`），界面每 350ms 问一次 `/dsh-updater/update` | 真的往前走，写明第几步、自检到哪一项 |
+| 装：停 DSH → 备份 → 装核心 →（装插件）→ 起 DSH | 没人。DSH 已经停了，那个端口上什么都没有 | 流动，只报已用时 |
+| 收尾 | 新 DSH 起来以后，从 `<核心树>\.dsh-updater\last-update.json` 读回脚本记的那几笔 | 走到头，列出每一步花了多久 |
+
+中间那段没法直播，原因很实在：换核心树之前 DSH 必须停掉（文件被占着时 npm 装不进去），
+停掉以后就没有服务能回答「现在到哪一步了」。所以脚本改成把进度写在磁盘上——每走完一步
+重写一次 `last-update.json`；新 DSH 一启动，状态接口就能把那份记录读回来，弹窗接着把条子走完。
+
+那份记录长这样（`Set-Content -Encoding UTF8` 写的，是带 BOM 的 UTF-8，宿主读之前先剥掉）：
+
+```json
+{
+  "ok": true, "running": false, "rollback": false,
+  "from": "0.2.2-rc.5", "to": "0.2.2-rc.6",
+  "startedAt": "2026-11-20T04:16:10Z", "updatedAt": "2026-11-20T04:16:13Z",
+  "step": null, "total": 4,
+  "steps": [
+    { "id": "stop", "ms": 8, "at": "..." },
+    { "id": "backup", "ms": 9, "at": "..." },
+    { "id": "install", "ms": 837, "at": "..." },
+    { "id": "start", "ms": 2066, "at": "..." }
+  ],
+  "error": null, "logFile": ".../update-20261120-121610.log"
+}
+```
+
+- `total`：这次一共几步（没插件 4 步，有插件 5 步）
+- `step`：现在停在哪一步；失败时就是卡住的那一步（装不上 = `install`）
+- `steps`：走完的步骤，按顺序，带耗时
+- `running`：脚本还活着。新 DSH 起来时可能还看到它，再等一秒就是结论
+
+徽标面板里的「上次更新」读的是同一份记录：一根小条 + 每步耗时，成功绿、回滚橙、失败红。
+重启之后想再看一眼，`GET /dsh-updater/status` 的 `lastUpdate` 里就是它。
 
 ## 什么时候不给自动更新
 
@@ -124,6 +165,7 @@ profile 的每个 bundle 对着**目标版本**算一遍：
 npm test                          # 宿主 + 浏览器两个半侧的离线检查
 node tests/dry-run.mjs            # 只跑更新脚本的 -DryRun：核对路径、npm、版本，什么都不动
 node tests/compat-preview.mjs X   # 预演：profile 里的插件对着核心 X 会不会被挡（只读）
+node tests/script-flow.mjs        # 真跑一遍更新脚本（假核心树、假 npm、假 DSH），只看它留下的进度记录
 ```
 
 `tests/dry-run.mjs` 要从普通终端跑：DSH 沙盒里的进程拉不起 powershell（EPERM）。

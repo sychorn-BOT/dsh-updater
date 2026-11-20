@@ -267,6 +267,28 @@ const lastPayload = JSON.parse((await callRoute(updateStatusRoute, { method: 'GE
 ok('状态接口带回上次更新的结论', lastPayload.lastUpdate?.to === '9.9.9' && lastPayload.lastUpdate?.rollback === true,
   JSON.stringify(lastPayload.lastUpdate))
 
+// 更新脚本是用 Windows PowerShell 5.1 的 Set-Content -Encoding UTF8 写这份文件的，
+// 那是带 BOM 的 UTF-8；JSON.parse 遇到 BOM 直接抛错，所以读的时候必须先去掉。
+const updatedAt = '2026-11-15T01:00:05Z'
+writeFileSync(join(fakeCore, '.dsh-updater', 'last-update.json'), '\uFEFF' + JSON.stringify({
+  ok: true, running: false, rollback: false, from: '0.0.1', to: '9.9.9',
+  at: updatedAt, startedAt: '2026-11-15T01:00:00Z', updatedAt, step: null, total: 4,
+  steps: [
+    { id: 'stop', ms: 320, at: '2026-11-15T01:00:01Z' },
+    { id: 'backup', ms: 90, at: '2026-11-15T01:00:01Z' },
+    { id: 'install', ms: 114000, at: '2026-11-15T01:00:03Z' },
+    { id: 'start', ms: 4200, at: '2026-11-15T01:00:04Z' },
+  ],
+  error: '', logFile: 'x.log',
+}, null, 2))
+const bomPayload = JSON.parse((await callRoute(updateStatusRoute, { method: 'GET', url: '/dsh-updater/status?refresh=1' })).body)
+ok('PowerShell 写的带 BOM 的 JSON 也读得出来', bomPayload.lastUpdate?.ok === true, JSON.stringify(bomPayload.lastUpdate))
+ok('读回每一步的耗时', bomPayload.lastUpdate?.steps.length === 4 && bomPayload.lastUpdate?.steps[2].ms === 114000,
+  JSON.stringify(bomPayload.lastUpdate?.steps))
+ok('条子要的百分比和总耗时都算好了',
+  bomPayload.lastUpdate?.percent === 100 && bomPayload.lastUpdate?.elapsedMs === 118610,
+  `percent=${bomPayload.lastUpdate?.percent} elapsedMs=${bomPayload.lastUpdate?.elapsedMs}`)
+
 /* ───────────────── 两个「别把服务白停掉」的护栏 ───────────────── */
 
 async function freshUpdateInstance(options) {
@@ -358,6 +380,65 @@ ok('脚本跑不起来时也直接报错', resNoScript.statusCode === 503
   && noScriptPayload.error.includes('running scripts is disabled'), resNoScript.body)
 ok('脚本报错时也不退场', guardNoScript.state.shutdowns === 0, `shutdown ${guardNoScript.state.shutdowns} 次`)
 
+/* ───────────────── 更新进度：宿主自己那五步 ───────────────── */
+// 「现在更新」按下去到宿主退场之间，界面还问得到它：这几步是真的，不是估的。
+let releasePreflight = null
+const progressGuard = await freshUpdateInstance({
+  preflight: async (_ctx, _cap, _prepared, _settings, _gate, report) => {
+    report('script')
+    await new Promise((resolveWait) => { releasePreflight = resolveWait })
+    return healthyPreflight()
+  },
+  spawnUpdate: () => ({ pid: 4242 }),
+})
+
+const pendingUpdate = postUpdate(progressGuard.start)
+// 前面几步要打 npm，等它走到「自检」那一步（自检被这个测试按住了，不会自己往下走）
+let midPayload = null
+const midDeadline = Date.now() + 15_000
+while (Date.now() < midDeadline) {
+  midPayload = JSON.parse((await callRoute(progressGuard.start, { method: 'GET', url: '/dsh-updater/update' })).body)
+  if (midPayload.steps?.find((step) => step.id === 'plan')?.status === 'done') break
+  await new Promise((resolveWait) => setTimeout(resolveWait, 100))
+}
+ok('准备阶段就能问到这次的步骤', midPayload.phase === 'preparing' && Array.isArray(midPayload.steps)
+  && midPayload.steps.length === 5, JSON.stringify(midPayload.steps))
+ok('走完的步骤标成 done', ['check', 'gate', 'plan'].every((id) => midPayload.steps.find((step) => step.id === id)?.status === 'done'),
+  JSON.stringify(midPayload.steps.map((step) => `${step.id}:${step.status}`)))
+ok('正在自检的那一步在跑', midPayload.steps.find((step) => step.id === 'preflight')?.status === 'running',
+  JSON.stringify(midPayload.steps))
+ok('自检的小项也报出来', midPayload.detail === 'script', String(midPayload.detail))
+ok('百分比按走完的步骤算', midPayload.percent === 60, String(midPayload.percent))
+
+const resAgainWhilePreparing = await postUpdate(progressGuard.start)
+ok('准备阶段再点一次被 409 挡住', resAgainWhilePreparing.statusCode === 409, resAgainWhilePreparing.body)
+
+releasePreflight()
+const settledPayload = JSON.parse((await pendingUpdate).body)
+ok('POST 回来的时候五步都走完了', settledPayload.percent === 100
+  && settledPayload.steps.every((step) => step.status === 'done'),
+  JSON.stringify(settledPayload.steps?.map((step) => `${step.id}:${step.status}`)))
+
+// 3b. 自检不过：卡在自检那一步，状态回到 idle（下一个 POST 还能再来）
+const stuckGuard = await freshUpdateInstance({
+  preflight: async (_ctx, _cap, _prepared, _settings, _gate, report) => {
+    report('script')
+    return {
+      powershell: { ok: true, code: 7, error: null, stderr: '' },
+      npm: { ok: true, code: 0, version: '10.9.0', error: null, stderr: '' },
+      script: { ok: false, code: 1, error: '退出码 1', stderr: 'running scripts is disabled' },
+    }
+  },
+  spawnUpdate: () => { throw new Error('自检不过不该去拉执行器') },
+})
+const resStuck = await postUpdate(stuckGuard.start)
+ok('自检不过时 POST 直接报错', resStuck.statusCode === 503, resStuck.body)
+const afterStuck = JSON.parse((await callRoute(stuckGuard.start, { method: 'GET', url: '/dsh-updater/update' })).body)
+ok('失败以后状态回到 idle', afterStuck.phase === 'idle', String(afterStuck.phase))
+ok('失败的那一步标成 failed',
+  afterStuck.steps.find((step) => step.id === 'preflight')?.status === 'failed',
+  JSON.stringify(afterStuck.steps?.map((step) => `${step.id}:${step.status}`)))
+
 // 4. 自检工具本身：条件齐了 / 差在哪
 const doctorTools = []
 apply({ inject: (_l, run) => run({
@@ -446,6 +527,22 @@ ok('自检总述里点名挡路的插件', String(gateValue.summary).includes('�
 
 process.argv[1] = savedArgv
 rmSync(fileURLToPath(new URL('./.tmp/', import.meta.url)), { recursive: true, force: true })
+
+/* ───────────────── 进度条的步骤 id：两边得是一套 ───────────────── */
+// 脚本按 id 写、浏览器半侧按 id 查文案，中间没人做翻译。改了一边忘了另一边，
+// 界面不会崩（认不出的 id 原样显示），但用户会看到 "install 3分02秒" 这种。
+const psSource = readFileSync(new URL('../scripts/update-dsh.ps1', import.meta.url), 'utf8')
+const clientSource = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
+const SCRIPT_IDS = ['stop', 'backup', 'install', 'plugins', 'start']
+const HOST_IDS = ['check', 'gate', 'plan', 'preflight', 'spawn']
+
+const scriptMissing = SCRIPT_IDS.filter((id) => !psSource.includes(`-Id '${id}'`) && !psSource.includes(`-Step '${id}'`))
+ok('脚本每一步都往进度记录里写一笔', scriptMissing.length === 0, scriptMissing.join(','))
+const labelMissing = [...SCRIPT_IDS, ...HOST_IDS].filter((id) => !new RegExp(`\\b${id}: 'step`).test(clientSource))
+ok('浏览器半侧认得所有这些步骤 id', labelMissing.length === 0, labelMissing.join(','))
+ok('脚本记的步骤总数和写完的步骤对得上',
+  psSource.includes("$script:TotalSteps = 4") && psSource.includes("$script:TotalSteps = 5"),
+  '总步数固定 4，有插件时 5')
 
 // ── bootstrap 里的 detach 判定 ─────────────────────────────
 const bootLine = '[23:30:16] start pid=1 plan=E:/x/plan-20261115-233016.json\n'

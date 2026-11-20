@@ -402,7 +402,10 @@ ok('过了准备期显示正在装', dialogView.text.includes('正在装新版�
 await sleep(2200)
 dialogView = render(() => PromptComponent({ ctx: zhCtx }))
 ok('服务断开以后显示正在重启', dialogView.text.includes('DSH 正在重启'), JSON.stringify(dialogView.text))
-ok('断开以后给一个「知道了」', dialogView.buttons.map(textOf).includes('知道了'), dialogView.buttons.map(textOf).join('|'))
+ok('断开以后条子变成流动的（不知道到哪一步了）',
+  dialogView.nodes.some((node) => node.props?.['data-dsh-updater-indeterminate'] !== undefined),
+  JSON.stringify(dialogView.text))
+ok('断开以后可以关掉窗口', dialogView.buttons.map(textOf).includes('关闭'), dialogView.buttons.map(textOf).join('|'))
 
 /* ─────────────────────────── 选「稍后」 ─────────────────────────── */
 
@@ -482,6 +485,274 @@ await sleep(200)
 failView = render(() => failPrompt({ ctx: zhCtx }))
 ok('宿主说脚本没跑起来时把原因显示出来', failView.text.includes('更新没能开始：npm 不存在'), JSON.stringify(failView.text))
 ok('这种情况给「知道了」', failView.buttons.map(textOf).includes('知道了'), failView.buttons.map(textOf).join('|'))
+
+/* ─────────────────────────── 进度条：三段走完 ─────────────────────────── */
+// 宿主还活着（sending，真步进） → DSH 不在（applying/offline，流动） → 新 DSH 回来（done，走到头）
+// 这一段用一个新模块实例：它有自己的 shared 缓存、prompt 开关和 hooks。
+
+const progressRegistration = bootClientModule()
+const progressModule = progressRegistration.factory((spec) => {
+  if (spec === 'react') return React
+  throw new Error(`unexpected require(${spec})`)
+})
+let progressPrompt = null
+progressModule.apply({
+  ...zhCtx,
+  slots: {
+    inject: (_key, callback) => { callback(); return () => {} },
+    register: (options, component) => {
+      if (options.name === 'shell.overlay') progressPrompt = component
+      return () => {}
+    },
+  },
+})
+
+/** 宿主那五步：done 个完成，running 那一步在跑。 */
+function prepSteps(doneCount, running, detail = null) {
+  const ids = ['check', 'gate', 'plan', 'preflight', 'spawn']
+  return {
+    steps: ids.map((id, index) => ({
+      id,
+      status: index < doneCount ? 'done' : (id === running ? 'running' : 'pending'),
+      at: null,
+    })),
+    percent: Math.round((doneCount / ids.length) * 100),
+    detail,
+  }
+}
+
+/** 脚本写下的那条记录：时间是相对现在造的，不然「是不是这一次」的时间检查会把它当旧的。 */
+function finishedRecord(overrides = {}) {
+  const now = Date.now()
+  const iso = (offset) => new Date(now + offset).toISOString()
+  return {
+    ok: true,
+    running: false,
+    rollback: false,
+    from: '0.2.1-rc.5',
+    to: '0.2.2-rc.1',
+    at: iso(-1000),
+    startedAt: null,
+    updatedAt: null,
+    step: null,
+    total: 4,
+    percent: 100,
+    // 总耗时由各步之和算出来（187000ms = 3分07秒），时间戳这里不掺和
+    steps: [
+      { id: 'stop', ms: 320, at: iso(-187000) },
+      { id: 'backup', ms: 90, at: iso(-186000) },
+      { id: 'install', ms: 182390, at: iso(-186000) },
+      { id: 'start', ms: 4200, at: iso(-5000) },
+    ],
+    error: null,
+    logFile: 'E:/dsh/dsh/.dsh-updater/update-1.log',
+    ...overrides,
+  }
+}
+
+storage.clear()
+let updateMode = 'preparing'
+let prepNow = prepSteps(0, 'check')
+let postResolve = null
+let progressRecord = null
+
+globalThis.fetch = async (url, options = {}) => {
+  if (options.method === 'POST') {
+    // POST 先挂着：宿主正在自检，界面这几秒问得到真步子
+    return await new Promise((resolve) => {
+      postResolve = () => resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          phase: 'scheduled',
+          target: '0.2.2-rc.1',
+          from: '0.2.1-rc.5',
+          logFile: 'E:/dsh/dsh/.dsh-updater/update-1.log',
+          steps: prepSteps(5, null).steps,
+          percent: 100,
+        }),
+      })
+    })
+  }
+  if (String(url).includes('dsh-updater/update')) {
+    if (updateMode === 'down') throw new Error('ECONNREFUSED')
+    if (updateMode === 'back') {
+      return { ok: true, status: 200, json: async () => ({ ok: true, phase: 'idle', steps: [], lastUpdate: progressRecord }) }
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ ok: true, phase: 'preparing', ...prepNow, lastUpdate: null }),
+    }
+  }
+  return { ok: true, json: async () => statusPayload() }
+}
+
+resetHooks()
+let pView = render(() => progressPrompt({ ctx: zhCtx }))
+await sleep(20)
+pView = render(() => progressPrompt({ ctx: zhCtx }))
+pView.buttons.find((node) => textOf(node) === '现在更新').props.onClick()
+await sleep(30)
+pView = render(() => progressPrompt({ ctx: zhCtx }))
+await sleep(60)
+pView = render(() => progressPrompt({ ctx: zhCtx }))
+
+function barNode(view) {
+  return view.nodes.find((node) => node.props?.['data-dsh-updater-bar'] !== undefined)
+}
+function percentText(view) {
+  const node = view.nodes.find((node) => node.props?.['data-dsh-updater-percent'] !== undefined)
+  return node === undefined ? null : textOf(node)
+}
+
+ok('准备阶段就有进度条', barNode(pView) !== undefined, JSON.stringify(pView.text))
+ok('准备阶段报第几步', pView.text.includes('正在准备 0/5'), JSON.stringify(pView.text))
+ok('准备阶段条子有百分比', percentText(pView) === '0%', String(percentText(pView)))
+
+prepNow = prepSteps(2, 'preflight', 'script')
+await sleep(400)
+pView = render(() => progressPrompt({ ctx: zhCtx }))
+ok('宿主往前走一步，条子跟着涨', percentText(pView) === '40%', String(percentText(pView)))
+ok('条子写明正在自检哪一项',
+  pView.text.includes('检查插件兼容') === false && pView.text.includes('环境自检') && pView.text.includes('更新脚本'),
+  JSON.stringify(pView.text))
+ok('条子的填充宽度按百分比来', barNode(pView)?.children?.[0]?.props?.style?.width === '40%',
+  JSON.stringify(barNode(pView)?.children?.[0]?.props?.style))
+
+postResolve()
+await sleep(40)
+pView = render(() => progressPrompt({ ctx: zhCtx }))
+ok('宿主答应以后条子满格', percentText(pView) === '100%', String(percentText(pView)))
+ok('满格时说明准备完了', pView.text.includes('正在准备 5/5'), JSON.stringify(pView.text))
+
+// 1.5s 之后宿主退场，条子只能流动着等
+await sleep(1700)
+pView = render(() => progressPrompt({ ctx: zhCtx }))
+ok('DSH 不在的时候条子流动', barNode(pView)?.props?.['data-dsh-updater-indeterminate'] !== undefined,
+  JSON.stringify(barNode(pView)?.props))
+ok('流动的时候报已用时', /正在装新版本 · 已用时 \d/.test(pView.text), JSON.stringify(pView.text))
+
+// 服务断开两次 → offline，但还在等（这次不再放弃）
+updateMode = 'down'
+await sleep(2600)
+pView = render(() => progressPrompt({ ctx: zhCtx }))
+ok('服务断开以后说 DSH 不在', pView.text.includes('DSH 不在，正在装或重启'), JSON.stringify(pView.text))
+ok('断开以后还能关窗口', pView.buttons.map(textOf).includes('关闭'), pView.buttons.map(textOf).join('|'))
+
+// 新 DSH 起来了：读回脚本写的那条记录，条子走到头
+updateMode = 'back'
+progressRecord = finishedRecord()
+await sleep(1300)
+pView = render(() => progressPrompt({ ctx: zhCtx }))
+ok('新 DSH 回来以后显示更新完成', pView.text.includes('更新完成'), JSON.stringify(pView.text))
+ok('完成时条子满格', percentText(pView) === '100%', String(percentText(pView)))
+ok('完成时列出每步耗时', pView.text.includes('装核心 3分02秒') && pView.text.includes('停 DSH 0.3秒'), JSON.stringify(pView.text))
+ok('完成时给出总耗时', pView.text.includes('已用时 3分07秒'), JSON.stringify(pView.text))
+ok('完成时给「重新载入页面」', pView.buttons.map(textOf).includes('重新载入页面'), pView.buttons.map(textOf).join('|'))
+ok('完成时不再给「现在更新」', !pView.buttons.map(textOf).includes('现在更新'), pView.buttons.map(textOf).join('|'))
+ok('完成的条子是绿的', barNode(pView)?.props?.['data-dsh-updater-tone'] === 'success',
+  String(barNode(pView)?.props?.['data-dsh-updater-tone']))
+
+/* ─────────────────────────── 进度条：回滚那次 ─────────────────────────── */
+
+const rollbackRegistration = bootClientModule()
+const rollbackModule = rollbackRegistration.factory((spec) => {
+  if (spec === 'react') return React
+  throw new Error(`unexpected require(${spec})`)
+})
+let rollbackPrompt = null
+rollbackModule.apply({
+  ...zhCtx,
+  slots: {
+    inject: (_key, callback) => { callback(); return () => {} },
+    register: (options, component) => {
+      if (options.name === 'shell.overlay') rollbackPrompt = component
+      return () => {}
+    },
+  },
+})
+
+storage.clear()
+const rolledBack = finishedRecord({
+  ok: false,
+  rollback: true,
+  percent: 50,
+  step: 'install',
+  error: 'npm install failed (exit 1); rolled back to 0.2.1-rc.5',
+  steps: [
+    { id: 'stop', ms: 320, at: new Date().toISOString() },
+    { id: 'backup', ms: 90, at: new Date().toISOString() },
+  ],
+  total: 4,
+})
+globalThis.fetch = async (url, options = {}) => {
+  if (options.method === 'POST') {
+    return { ok: true, status: 200, json: async () => ({ ok: true, phase: 'scheduled', target: '0.2.2-rc.1', from: '0.2.1-rc.5' }) }
+  }
+  if (String(url).includes('dsh-updater/update')) {
+    return { ok: true, status: 200, json: async () => ({ ok: true, phase: 'idle', steps: [], lastUpdate: rolledBack }) }
+  }
+  return { ok: true, json: async () => statusPayload() }
+}
+
+resetHooks()
+let rView = render(() => rollbackPrompt({ ctx: zhCtx }))
+await sleep(20)
+rView = render(() => rollbackPrompt({ ctx: zhCtx }))
+rView.buttons.find((node) => textOf(node) === '现在更新').props.onClick()
+await sleep(30)
+rView = render(() => rollbackPrompt({ ctx: zhCtx }))
+await sleep(1700)
+rView = render(() => rollbackPrompt({ ctx: zhCtx }))
+await sleep(1200)
+rView = render(() => rollbackPrompt({ ctx: zhCtx }))
+await sleep(200)
+rView = render(() => rollbackPrompt({ ctx: zhCtx }))
+
+ok('回滚以后说成回滚', rView.text.includes('这次更新回滚了'), JSON.stringify(rView.text))
+ok('回滚时点名卡在哪一步', rView.text.includes('卡在 装核心'), JSON.stringify(rView.text))
+ok('回滚时把原因摊出来', rView.text.includes('npm install failed'), JSON.stringify(rView.text))
+ok('回滚的条子是橙的（不是绿的）', barNode(rView)?.props?.['data-dsh-updater-tone'] === 'warn',
+  String(barNode(rView)?.props?.['data-dsh-updater-tone']))
+ok('回滚时条子停在没走完的位置', percentText(rView) === '50%', String(percentText(rView)))
+ok('回滚时给「关闭」不给「重新载入」', rView.buttons.map(textOf).includes('关闭')
+  && !rView.buttons.map(textOf).includes('重新载入页面'), rView.buttons.map(textOf).join('|'))
+
+/* ─────────────────────────── 徽标面板里的上次更新 ─────────────────────────── */
+
+const panelRegistration = bootClientModule()
+const panelModule = panelRegistration.factory((spec) => {
+  if (spec === 'react') return React
+  throw new Error(`unexpected require(${spec})`)
+})
+let panelComponent = null
+panelModule.apply({
+  ...zhCtx,
+  slots: {
+    inject: (_key, callback) => { callback(); return () => {} },
+    register: (options, component) => {
+      if (options.name === 'conversation.composer.dock') panelComponent = component
+      return () => {}
+    },
+  },
+})
+
+globalThis.fetch = async () => ({ ok: true, json: async () => statusPayload({ lastUpdate: finishedRecord() }) })
+resetHooks()
+let panelView = render(panelComponent)
+await sleep(20)
+panelView = render(panelComponent)
+panelView.button.props.onClick()
+panelView = render(panelComponent)
+ok('面板里画上次更新的进度条',
+  panelView.nodes.some((node) => node.props?.['data-dsh-updater-panel-bar'] !== undefined),
+  JSON.stringify(panelView.text))
+ok('面板里列出每步耗时', panelView.text.includes('装核心 3分02秒'), JSON.stringify(panelView.text))
+ok('面板里带上这次的总耗时', panelView.text.includes('已用时 3分07秒'), JSON.stringify(panelView.text))
+ok('面板里的条子是绿的', panelView.nodes.find((node) => node.props?.['data-dsh-updater-bar'] !== undefined)
+  ?.props?.['data-dsh-updater-tone'] === 'success')
 
 const failed = checks.filter((check) => !check.pass)
 console.log(`\n${checks.length - failed.length}/${checks.length} 通过`)

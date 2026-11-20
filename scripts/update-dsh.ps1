@@ -118,27 +118,77 @@ function Get-ServerProcess {
   try { return Get-Process -Id ([int]$cfg.serverPid) -ErrorAction SilentlyContinue } catch { return $null }
 }
 
+# ---- progress -------------------------------------------------------------
+#
+# The browser half draws one progress bar for the whole update. While the host is
+# still alive it reports its own five steps over HTTP. After the host exits there
+# is no server at all until DSH is back -- the bar has nothing to ask. So this
+# script keeps the record on disk instead: every finished step is appended to
+# last-update.json, which the restarted DSH reads back and the bar finishes with
+# the real per-step timings.
+#
+# Step ids are a contract with lib/index.js and client.js -- keep them in sync:
+#   stop, backup, install, plugins, start
+
+$script:StartedAt = (Get-Date).ToUniversalTime()
+$script:Steps = @()
+$pendingPlugins = @($cfg.plugins | Where-Object { $null -ne $_ })
+$script:TotalSteps = 4
+if ($null -ne $cfg.profileDir -and [string]$cfg.profileDir -ne '' -and $pendingPlugins.Count -gt 0) {
+  $script:TotalSteps = 5
+}
+
+function Save-Progress {
+  param(
+    [string]$Step = $null,
+    [bool]$Running = $true,
+    [bool]$Ok = $false,
+    [bool]$Rollback = $false,
+    [string]$ErrorMessage = ''
+  )
+  $now = (Get-Date).ToUniversalTime()
+  $payload = [ordered]@{
+    ok        = $Ok
+    running   = $Running
+    rollback  = $Rollback
+    from      = [string]$cfg.fromVersion
+    to        = [string]$cfg.version
+    at        = $now.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    startedAt = $script:StartedAt.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    updatedAt = $now.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    step      = $Step
+    total     = [int]$script:TotalSteps
+    steps     = @($script:Steps)
+    error     = $ErrorMessage
+    logFile   = $script:LogFile
+  }
+  try {
+    $payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $cfg.resultFile -Encoding UTF8
+  } catch {
+    Write-Log ('WARN: could not write the progress record: ' + $_.Exception.Message)
+  }
+}
+
+# One script step finished. $Next is what is running right now (null = nothing).
+function Add-Step {
+  param([string]$Id, [datetime]$Started, [string]$Next = $null)
+  $elapsed = [int]((Get-Date) - $Started).TotalMilliseconds
+  $script:Steps += [ordered]@{
+    id = $Id
+    ms = $elapsed
+    at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  }
+  Save-Progress -Step $Next -Running $true
+}
+
 function Write-Result {
   param(
     [bool]$Ok,
     [string]$ErrorMessage,
-    [bool]$Rollback
+    [bool]$Rollback,
+    [string]$Step = $null
   )
-  $payload = [ordered]@{
-    ok       = $Ok
-    running  = $false
-    from     = [string]$cfg.fromVersion
-    to       = [string]$cfg.version
-    at       = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-    rollback = $Rollback
-    error    = $ErrorMessage
-    logFile  = $script:LogFile
-  }
-  try {
-    $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $cfg.resultFile -Encoding UTF8
-  } catch {
-    Write-Log ('WARN: could not write result file: ' + $_.Exception.Message)
-  }
+  Save-Progress -Step $Step -Running $false -Ok $Ok -Rollback $Rollback -ErrorMessage $ErrorMessage
 }
 
 # How npm is launched. Node 24 refuses to spawn a .cmd directly (EINVAL), so the
@@ -380,23 +430,13 @@ if ($DryRun) {
   exit 0
 }
 
-# Mark the run as in progress right away: the host is already gone, and the old
-# verdict must not stay on the badge.
-try {
-  [ordered]@{
-    ok       = $false
-    running  = $true
-    from     = [string]$cfg.fromVersion
-    to       = [string]$cfg.version
-    at       = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-    rollback = $false
-    error    = $null
-    logFile  = $script:LogFile
-  } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $cfg.resultFile -Encoding UTF8
-} catch { }
+# Mark the run as in progress right away: the host is already gone, the old
+# verdict must not stay on the badge, and the first step starts here.
+Save-Progress -Step 'stop' -Running $true
 
 # ------------------------------------------------------------------ 1. stop
 
+$stepStarted = Get-Date
 if ($null -ne (Get-ServerProcess)) {
   Write-Log ('waiting for pid {0} to exit (up to {1}s) ...' -f $cfg.serverPid, $cfg.stopTimeoutSeconds)
   $deadline = (Get-Date).AddSeconds([int]$cfg.stopTimeoutSeconds)
@@ -418,9 +458,11 @@ if ($null -ne (Get-ServerProcess)) {
 } else {
   Write-Log 'old server stopped'
 }
+Add-Step -Id 'stop' -Started $stepStarted -Next 'backup'
 
 # ------------------------------------------------------- 2. back up, install
 
+$stepStarted = Get-Date
 $backupDir = $cfg.backupDir
 New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
 Copy-Item -LiteralPath $corePackage -Destination (Join-Path $backupDir 'package.json') -Force
@@ -429,6 +471,7 @@ if (Test-Path -LiteralPath $lockFile) {
   Copy-Item -LiteralPath $lockFile -Destination (Join-Path $backupDir 'package-lock.json') -Force
   Write-Log 'backed up package-lock.json'
 }
+Add-Step -Id 'backup' -Started $stepStarted -Next 'install'
 
 $installArgs = @(
   'install',
@@ -440,6 +483,7 @@ $installArgs = @(
 )
 $restoreArgs = @('install', '--no-audit', '--no-fund', '--registry', [string]$cfg.registry)
 
+$stepStarted = Get-Date
 $exitCode = Invoke-NpmInstall -NpmArgs $installArgs -Tag 'install'
 $installedVersion = Get-PackageVersion -PackageJson $dshPackage
 
@@ -452,6 +496,9 @@ if ((-not $exitOk) -or (-not $versionOk)) {
   Write-Log ('install FAILED (exit {0}, package now {1})' -f $(if ($null -eq $exitCode) { 'unknown' } else { $exitCode }), $installedVersion)
   Show-NpmTail -Tag 'install'
 
+  # Still working (rolling back) -- the record must not stay on the old step.
+  Save-Progress -Step 'install' -Running $true
+
   Write-Log 'rolling back package.json / package-lock.json'
   Restore-Backup -BackupDir $backupDir
   $rollbackExit = Invoke-NpmInstall -NpmArgs $restoreArgs -Tag 'rollback'
@@ -462,11 +509,14 @@ if ((-not $exitOk) -or (-not $versionOk)) {
   try { Start-DshServer } catch {
     Write-Log ('ERROR: could not restart after rollback: ' + $_.Exception.Message)
   }
-  Write-Result -Ok $false -Rollback $true -ErrorMessage ('npm install failed (exit {0}); rolled back to {1}' -f $exitCode, $cfg.fromVersion)
+  Write-Result -Ok $false -Rollback $true -Step 'install' -ErrorMessage ('npm install failed (exit {0}); rolled back to {1}' -f $(if ($null -eq $exitCode) { 'unknown' } else { $exitCode }), $cfg.fromVersion)
   exit 1
 }
 
 Write-Log ('install verified: @deepseek-ai/dsh {0}' -f $installedVersion)
+$nextStep = 'start'
+if ($null -ne $cfg.profileDir -and [string]$cfg.profileDir -ne '' -and $pendingPlugins.Count -gt 0) { $nextStep = 'plugins' }
+Add-Step -Id 'install' -Started $stepStarted -Next $nextStep
 
 # ------------------------------------------------- 3. plugins that must follow
 # A plugin whose dsh range only covers the new core cannot be installed while the
@@ -474,8 +524,8 @@ Write-Log ('install verified: @deepseek-ai/dsh {0}' -f $installedVersion)
 # nothing is running yet, so pnpm can install them for real.
 
 $profileTouched = $false
-$pendingPlugins = @($cfg.plugins | Where-Object { $null -ne $_ })
 if ($null -ne $cfg.profileDir -and [string]$cfg.profileDir -ne '' -and $pendingPlugins.Count -gt 0) {
+  $stepStarted = Get-Date
   Write-Log ('plugins to update: {0}' -f (($pendingPlugins | ForEach-Object { $_.name + ' ' + $_.from + ' -> ' + $_.to }) -join ', '))
   Backup-Profile
   $profileTouched = $true
@@ -496,6 +546,7 @@ if ($null -ne $cfg.profileDir -and [string]$cfg.profileDir -ne '' -and $pendingP
   }
 
   if ($null -ne $pluginFailure) {
+    Save-Progress -Step 'plugins' -Running $true
     Write-Log 'rolling back profile + core'
     Restore-Profile
     Restore-Backup -BackupDir $backupDir
@@ -505,26 +556,29 @@ if ($null -ne $cfg.profileDir -and [string]$cfg.profileDir -ne '' -and $pendingP
     try { Start-DshServer } catch {
       Write-Log ('ERROR: could not restart after rollback: ' + $_.Exception.Message)
     }
-    Write-Result -Ok $false -Rollback $true -ErrorMessage ('plugin {0} could not be installed; rolled back' -f $pluginFailure.name)
+    Write-Result -Ok $false -Rollback $true -Step 'plugins' -ErrorMessage ('plugin {0} could not be installed; rolled back' -f $pluginFailure.name)
     exit 1
   }
+  Add-Step -Id 'plugins' -Started $stepStarted -Next 'start'
 } elseif ($pendingPlugins.Count -gt 0) {
   Write-Log 'WARN: plugin updates were requested but the plan has no profile directory; skipping them'
 }
 
 # ------------------------------------------------------------------ 4. start
 
+$stepStarted = Get-Date
 try {
   Start-DshServer
 } catch {
   Write-Log ('ERROR: could not start server: ' + $_.Exception.Message)
-  Write-Result -Ok $false -Rollback $false -ErrorMessage ('installed {0} but could not start it: {1}' -f $cfg.version, $_.Exception.Message)
+  Write-Result -Ok $false -Rollback $false -Step 'start' -ErrorMessage ('installed {0} but could not start it: {1}' -f $cfg.version, $_.Exception.Message)
   exit 1
 }
 
 Start-Sleep -Seconds 2
 if (Test-DshServer -Seconds 40) {
   Write-Log ('server is listening on port {0}' -f $cfg.port)
+  Add-Step -Id 'start' -Started $stepStarted
   Write-Result -Ok $true -Rollback $false -ErrorMessage ''
   Write-Log 'DONE'
   exit 0
@@ -542,5 +596,5 @@ Write-Log ('rollback: exit {0}, package now {1}' -f $rollbackExit, $restored)
 try { Start-DshServer } catch {
   Write-Log ('ERROR: could not restart the previous version: ' + $_.Exception.Message)
 }
-Write-Result -Ok $false -Rollback $true -ErrorMessage ('{0} did not start; rolled back to {1}' -f $cfg.version, $cfg.fromVersion)
+Write-Result -Ok $false -Rollback $true -Step 'start' -ErrorMessage ('{0} did not start; rolled back to {1}' -f $cfg.version, $cfg.fromVersion)
 exit 1
